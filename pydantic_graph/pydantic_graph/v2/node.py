@@ -6,7 +6,7 @@ from typing import Any
 from typing_extensions import TypeGuard
 
 from pydantic_graph.v2.decision import Decision
-from pydantic_graph.v2.id_types import NodeId
+from pydantic_graph.v2.id_types import ForkId, NodeId
 from pydantic_graph.v2.join import Join
 from pydantic_graph.v2.spread import Spread
 from pydantic_graph.v2.step import Step
@@ -44,5 +44,6 @@ def is_source(node: AnyNode) -> TypeGuard[AnySourceNode]:
 def is_destination(node: AnyNode) -> TypeGuard[AnyDestinationNode]:
     return isinstance(node, (EndNode, Step, Join, Decision))
 
-def get_default_spread_id(source: AnySourceNode, destination: AnyDestinationNode) -> NodeId:
-    return NodeId(f'__spread__:{source.id}:{destination.id}')
+
+def get_default_spread_id(source: AnySourceNode, destination: AnyDestinationNode) -> ForkId:
+    return ForkId(f'__spread__:{source.id}:{destination.id}')

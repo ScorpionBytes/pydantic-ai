@@ -4,7 +4,6 @@ from typing import NewType
 
 NodeId = NewType('NodeId', str)
 NodeRunId = NewType('NodeRunId', str)
-WalkerId = NewType('WalkerId', str)
 
 JoinId = NewType('JoinId', NodeId)
 ForkId = NewType('ForkId', NodeId)

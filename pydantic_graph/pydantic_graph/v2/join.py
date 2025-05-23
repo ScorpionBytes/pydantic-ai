@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Any
+from typing import Any, Callable
 
-from pydantic_graph.v2.id_types import NodeId, NodeRunId, ForkId, JoinId
+from pydantic_graph.v2.id_types import ForkId, JoinId, NodeRunId
 
 
 class ReducerContext:
@@ -49,4 +49,3 @@ class Join[StateT, InputT, OutputT]:
     # TODO: Need to implement a version of DominatingForkFinder that validates the specified NodeId is valid
     # Maybe should call this "parent_fork" or similar..
     joins: ForkId | None = None  # the NodeID of the node to use as the dominating fork
-

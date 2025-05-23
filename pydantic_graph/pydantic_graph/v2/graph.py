@@ -5,12 +5,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable, Never, overload
 
-from anyio import create_task_group, create_memory_object_stream
-from anyio.streams.memory import MemoryObjectReceiveStream
+from typing_extensions import assert_never
 
 from pydantic_graph.v2.decision import Decision
 from pydantic_graph.v2.dominating_forks import DominatingFork, DominatingForkFinder
-from pydantic_graph.v2.id_types import NodeRunId, WalkerId, JoinId, ForkId
+from pydantic_graph.v2.id_types import ForkId, JoinId, NodeRunId
 from pydantic_graph.v2.join import Join, Reducer
 from pydantic_graph.v2.node import (
     END,
@@ -27,7 +26,7 @@ from pydantic_graph.v2.node import (
 )
 from pydantic_graph.v2.spread import Spread
 from pydantic_graph.v2.step import Step, StepCallProtocol, StepContext
-from pydantic_graph.v2.transform import TransformFunction, TransformContext
+from pydantic_graph.v2.transform import TransformContext, TransformFunction
 from pydantic_graph.v2.util import get_callable_name, get_unique_string
 
 
@@ -78,8 +77,9 @@ class GraphBuilder[StateT, GraphInputT, GraphOutputT]:
     def build_join[InputT, OutputT](
         self, reducer_factory: Callable[[StateT, InputT], Reducer[StateT, InputT, OutputT]]
     ) -> Join[StateT, InputT, OutputT]:
+        # TODO: Need to allow specifying the id manually to prevent conflicts if there are multiple spreads between the same two nodes
         return Join[StateT, InputT, OutputT](
-            id=NodeId(f'join-{get_callable_name(reducer_factory)}-{get_unique_string()}'),
+            id=JoinId(NodeId(f'join-{get_callable_name(reducer_factory)}-{get_unique_string()}')),
             reducer_factory=reducer_factory,
         )
 
@@ -155,13 +155,7 @@ class GraphBuilder[StateT, GraphInputT, GraphOutputT]:
         pre_spread_transform: TransformFunction[StateT, Any, Any, Sequence[Any]] | None = None,
         post_spread_transform: TransformFunction[StateT, Any, Any, Any] | None = None,
     ) -> None:
-        # TODO: Generate a unique spread id for each spread between the same source and destination.
-        #   I think we don't need to worry about uniqueness because we won't snapshot state at spreads, just
-        #   at the start and after each step/join. Decisions and Spreads are simple enough to not need state
-        #   snapshotting. However, they should still remain as nodes to make the graph analysis simpler later on,
-        #   not to mention we have a roughly-working implementation that relies on them being nodes, in particular,
-        #   I need a way to track if a worker went down a fork caused by a spread, having it be a node makes that easier.
-        #   We might refactor to make them part of edges for cleaner serialization later.
+        # TODO: Need to allow specifying the id manually to prevent conflicts if there are multiple spreads between the same two nodes
         spread = Spread[Any, Any, Any](id=get_default_spread_id(START, node))
         self._add_edge_from_nodes(
             source=START,
@@ -247,6 +241,7 @@ class GraphBuilder[StateT, GraphInputT, GraphOutputT]:
         pre_spread_transform: TransformFunction[StateT, SourceInputT, Any, Sequence[Any]] | None = None,
         post_spread_transform: TransformFunction[StateT, SourceInputT, Any, Any] | None = None,
     ) -> None:
+        # TODO: Need to allow specifying the id manually to prevent conflicts if there are multiple spreads between the same two nodes
         fork = Spread[Any, Any, Any](
             id=get_default_spread_id(source, destination),
         )
@@ -318,7 +313,7 @@ class GraphBuilder[StateT, GraphInputT, GraphOutputT]:
         * Error if the graph does not meet the every-join-has-a-source-fork requirement (otherwise can't know when to proceed past joins)
         * Generate forks for sources with multiple edges
         """
-        # TODO: Allow the user to specify the dominating forks, just infer them as necessary
+        # TODO: Allow the user to specify the dominating forks; only infer them if _not_ specified
         # TODO: Verify that any user-specified dominating nodes are _actually_ dominating forks, and if not, generate a helpful error message
         dominating_forks = _collect_dominating_forks(self._nodes, self._edges_by_source)
 
@@ -335,7 +330,7 @@ class GraphBuilder[StateT, GraphInputT, GraphOutputT]:
 
 def _collect_dominating_forks(
     graph_nodes: dict[NodeId, AnyNode], graph_edges_by_source: dict[NodeId, list[Edge]]
-) -> dict[NodeId, DominatingFork[NodeId]]:
+) -> dict[JoinId, DominatingFork[NodeId]]:
     nodes = set(graph_nodes)
     start_ids = {StartNode.start.id}
     edges = {source_id: [e.destination_id for e in graph_edges_by_source[source_id]] for source_id in nodes}
@@ -349,8 +344,8 @@ def _collect_dominating_forks(
         edges=edges,
     )
 
-    join_ids = {node_id for node_id, node in graph_nodes.items() if isinstance(node, Join)}
-    dominating_forks: dict[NodeId, DominatingFork[NodeId]] = {}
+    join_ids = {node.id for node in graph_nodes.values() if isinstance(node, Join)}
+    dominating_forks: dict[JoinId, DominatingFork[NodeId]] = {}
     for join_id in join_ids:
         dominating_fork = finder.find_dominating_fork(join_id)
         if dominating_fork is None:
@@ -399,10 +394,14 @@ class GraphWalkState:
     Stack of forks that have been entered; used so that the GraphRunner can decide when to proceed through joins
     """
 
+
 @dataclass
 class Some[T]:
     value: T
+
+
 type Maybe[T] = Some[T] | None  # like optional, but you can tell the difference between "no value" and "value is None"
+
 
 @dataclass
 class GraphRun[StateT, InputT, OutputT]:
@@ -411,9 +410,6 @@ class GraphRun[StateT, InputT, OutputT]:
     inputs: InputT
 
     result: Maybe[OutputT] = None
-    """
-    Note: should probably use a monad (i.e., `Maybe`) for this to distinguish between "no result" and "None is the result"
-    """
     active_walks: list[GraphWalkState] = field(init=False)
 
     active_reducers: dict[tuple[NodeId, NodeRunId], Reducer[StateT, Any, Any]] = field(init=False)
@@ -421,7 +417,9 @@ class GraphRun[StateT, InputT, OutputT]:
     # persistence: Any  # TODO: Implement use of this
 
     def __post_init__(self):
-        self.active_walks = [GraphWalkState(node_id=START.id, context_inputs=self.inputs, node_inputs=self.inputs, fork_stack=())]
+        self.active_walks = [
+            GraphWalkState(node_id=START.id, context_inputs=self.inputs, node_inputs=self.inputs, fork_stack=())
+        ]
         self.active_reducers = {}
 
     async def run(self):
@@ -445,13 +443,14 @@ class GraphRun[StateT, InputT, OutputT]:
                 self._handle_end(walk)
 
             # Now that we've handled edges for the node, we can check if any joins are ready to proceed, and if so, proceed
-            self._handle_finalize_joins(walk)  # TODO: Implement this;
+            self._handle_finalize_joins(walk)
 
         if self.result is None:
-            raise RuntimeError('Graph run completed, but no result was produced. This is either a bug in the graph or a bug in the graph runner.')
+            raise RuntimeError(
+                'Graph run completed, but no result was produced. This is either a bug in the graph or a bug in the graph runner.'
+            )
 
         return self.result
-
 
     def _handle_start(self, walk: GraphWalkState) -> None:
         # nothing to do besides start the graph
@@ -465,7 +464,7 @@ class GraphRun[StateT, InputT, OutputT]:
     def _handle_reduce_join(self, join: Join[Any, Any, Any], walk: GraphWalkState) -> None:
         # Find the matching fork run id in the stack; this will be used to look for an active reducer
         parent_fork = self.graph.get_dominating_fork(join.id)
-        matching_fork_run_id = next(iter((x[1] for x in walk.fork_stack[::-1] if x[0] == parent_fork.fork_id)), None)
+        matching_fork_run_id = next(iter(x[1] for x in walk.fork_stack[::-1] if x[0] == parent_fork.fork_id), None)
         if matching_fork_run_id is None:
             raise RuntimeError(
                 f'Fork {parent_fork.fork_id} not found in stack {walk.fork_stack}. This means the dominating fork is not dominating (this is a bug).'
@@ -487,7 +486,9 @@ class GraphRun[StateT, InputT, OutputT]:
         for destination_call, destination_id in step.destinations:
             if destination_call(walk.node_inputs):
                 # TODO: Need to apply transforms as required by the EdgeBranch; not yet implemented
-                self.active_walks.append(GraphWalkState(destination_id, walk.context_inputs, walk.node_inputs, walk.fork_stack))
+                self.active_walks.append(
+                    GraphWalkState(destination_id, walk.context_inputs, walk.node_inputs, walk.fork_stack)
+                )
                 break
 
     def _handle_end(self, walk: GraphWalkState) -> None:
@@ -497,7 +498,9 @@ class GraphRun[StateT, InputT, OutputT]:
     def _handle_finalize_joins(self, popped_walk: GraphWalkState) -> None:
         # If the popped walk was the last item preventing one or more joins, those joins can now be finalized
         walk_fork_run_ids = {fork_run_id: i for i, (_, fork_run_id) in enumerate(popped_walk.fork_stack)}
-        active_reducers_items = list(self.active_reducers.items())  # make a copy to avoid modifying the dict while iterating
+        active_reducers_items = list(
+            self.active_reducers.items()
+        )  # make a copy to avoid modifying the dict while iterating
 
         # Note: might be more efficient to maintain a better data structure for looking up reducers by join_id and
         # fork_run_id without iterating through every item. This only matters if there is a large number of reducers.
@@ -507,6 +510,7 @@ class GraphRun[StateT, InputT, OutputT]:
                 # This reducer _may_ now be ready to finalize:
                 join_can_proceed = True
                 for walk in self.active_walks:
+                    # might be a good idea to hold walks_by_fork_id in memory to reduce overhead here
                     if fork_run_id in {x[1] for x in walk.fork_stack}:
                         join_can_proceed = False
 
@@ -519,39 +523,40 @@ class GraphRun[StateT, InputT, OutputT]:
 
     def _handle_edges(self, walk: GraphWalkState, context_inputs: Any, next_node_inputs: Any) -> None:
         edges = self.graph.edges_by_source.get(walk.node_id, [])
+        node = self.graph.nodes[walk.node_id]
+
         fork_stack = walk.fork_stack
-        if len(edges) > 1:
-            # this node is a broadcast fork
+        if len(edges) > 1 or isinstance(node, Spread):
+            # first condition is a broadcast fork; note that the way graph building works,
+            # spread nodes should never be broadcast edges; even if there are multiple spreads between two nodes
+            # these should result in distinct spread instances
             node_run_id = NodeRunId(str(uuid.uuid4()))
-            fork_stack += ((walk.node_id, node_run_id),)
+            fork_stack += ((ForkId(walk.node_id), node_run_id),)
 
-        # Edge transitions should be fast, so maybe don't need to be handled in parallel
-        for edge in edges:
-            if edge.transform is not None:
-                transform_context = TransformContext(self.state, context_inputs, next_node_inputs)
-                next_node_inputs = edge.transform(transform_context)
+        assert not isinstance(node, (Decision, EndNode)), 'This method should not be called for Decision, EndNode'
+        if isinstance(node, (StartNode, Step, Join)):
+            # Edge transitions should be fast, so maybe don't need to be handled in parallel
+            for edge in edges:
+                if edge.transform is not None:
+                    transform_context = TransformContext(self.state, context_inputs, next_node_inputs)
+                    next_node_inputs = edge.transform(transform_context)
 
-            self.active_walks.append(GraphWalkState(edge.destination_id, context_inputs, next_node_inputs, fork_stack))
-            # destination = edge.destination(self.graph.nodes)
-            # if isinstance(destination, Step):
-            #     self.active_walks.append(GraphWalkStep(destination.id, context_inputs, next_node_inputs, fork_stack))
-            # elif isinstance(destination, Join):
-            #     # TODO: Handle joins; they proceed when the dominating fork is complete, NOT here
-            #     pass  # nothing to do, should have already been handled in `_handle_join`
-            # elif isinstance(destination, Spread):
-            #     # We update the fork_stack here rather than inside _handle_spread to make it easier to use a single value
-            #     spread_run_id = NodeRunId(str(uuid.uuid4()))
-            #     new_fork_stack = walk.fork_stack + ((destination.id, spread_run_id),)
-            #     self.active_walks.extend([GraphWalkStep(destination.id, context_inputs, item, new_fork_stack) for item in next_node_inputs])
-            # elif isinstance(destination, Decision):
-            #     self.active_walks.append(GraphWalkStep(destination.id, context_inputs, next_node_inputs, fork_stack))
-            # elif isinstance(destination, EndNode):
-            #     self.active_walks.append(GraphWalkStep(destination.id, context_inputs, next_node_inputs, fork_stack))
-            #     # self._handle_end(next_node_inputs)
-        # TODO: Check if joins are ready to proceed
-
+                self.active_walks.append(
+                    GraphWalkState(edge.destination_id, context_inputs, next_node_inputs, fork_stack)
+                )
+        elif isinstance(node, Spread):
+            for edge in edges:
+                for item in next_node_inputs:
+                    if edge.transform is not None:
+                        transform_context = TransformContext(self.state, context_inputs, item)
+                        item = edge.transform(transform_context)
+                    self.active_walks.append(GraphWalkState(edge.destination_id, context_inputs, item, fork_stack))
+        else:
+            assert_never(node)
 
     # async def run(self):
+    #     from anyio import create_task_group, create_memory_object_stream
+    #     from anyio.streams.memory import MemoryObjectReceiveStream
     #     send_result_stream, receive_result_stream = create_memory_object_stream[Any]()
     #
     #     async def run_step(step_ref: GraphWalkStep, inputs: Any):

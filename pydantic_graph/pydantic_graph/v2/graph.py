@@ -4,23 +4,26 @@ import uuid
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Never, overload
+from typing import Any, Callable, Never, cast, get_args, get_origin, overload
 
 from typing_extensions import assert_never
 
 from pydantic_graph.v2.decision import Decision, DecisionBranchBuilder
 from pydantic_graph.v2.id_types import ForkId, JoinId, NodeRunId
 from pydantic_graph.v2.join import Join, Reducer, ReducerContext
+from pydantic_graph.v2.mermaid import StateDiagramDirection, generate_code
 from pydantic_graph.v2.node import (
     END,
     START,
-    AnyDestinationNode,
-    AnyNode,
-    AnySourceNode,
     EndNode,
     NodeId,
     Spread,
     StartNode,
+)
+from pydantic_graph.v2.node_types import (
+    AnyDestinationNode,
+    AnyNode,
+    AnySourceNode,
     get_default_spread_id,
     is_destination,
     is_source,
@@ -36,6 +39,7 @@ class Edge:
     source_id: NodeId
     transform: AnyTransformFunction | None
     destination_id: NodeId
+    user_label: str | None
 
     def source(self, nodes: dict[NodeId, AnyNode]) -> AnySourceNode:
         node = nodes.get(self.source_id)
@@ -53,13 +57,22 @@ class Edge:
             raise ValueError(f'Node {self.destination_id} is not a source node: {node}')
         return node
 
+    @property
+    def label(self) -> str | None:
+        # TODO: Add some default behavior?
+        return self.user_label
+
+
+class TypeUnion[T]:
+    pass
+
 
 @dataclass
 class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
     state_type: type[StateT]
     deps_type: type[DepsT]
     input_type: type[GraphInputT]
-    output_type: type[GraphOutputT]
+    output_type: type[TypeUnion[GraphOutputT]] | type[GraphOutputT]
 
     _nodes: dict[NodeId, AnyNode] = field(init=False, default_factory=dict)
     _edges_by_source: dict[NodeId, list[Edge]] = field(init=False, default_factory=lambda: defaultdict(list))
@@ -74,34 +87,43 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
 
     # Node building:
     def build_step[InputT, OutputT](
-        self, call: StepCallProtocol[StateT, DepsT, InputT, OutputT]
+        self,
+        call: StepCallProtocol[StateT, DepsT, InputT, OutputT],
+        *,
+        node_id: str | None = None,
+        label: str | None = None,
     ) -> Step[StateT, DepsT, InputT, OutputT]:
-        return Step[StateT, DepsT, InputT, OutputT](
-            id=NodeId(f'step-{get_callable_name(call)}-{get_unique_string()}'), call=call
-        )
+        if node_id is None:
+            # TODO: Infer this from the parent frame variable assignment
+            node_id = f'step-{get_callable_name(call)}-{get_unique_string()}'
+        return Step[StateT, DepsT, InputT, OutputT](id=NodeId(node_id), call=call, user_label=label)
 
     def build_join[InputT, OutputT](
-        self, reducer_factory: Callable[[StateT, DepsT, InputT], Reducer[StateT, DepsT, InputT, OutputT]]
+        self,
+        reducer_factory: Callable[[StateT, DepsT, InputT], Reducer[StateT, DepsT, InputT, OutputT]],
+        *,
+        node_id: str | None = None,
     ) -> Join[StateT, DepsT, InputT, OutputT]:
-        # TODO: Need to allow specifying the id manually to prevent conflicts if there are multiple spreads between the same two nodes
+        if node_id is None:
+            # TODO: Infer this from the parent frame variable assignment
+            node_id = f'join-{get_callable_name(reducer_factory)}-{get_unique_string()}'
         return Join[StateT, DepsT, InputT, OutputT](
-            id=JoinId(NodeId(f'join-{get_callable_name(reducer_factory)}-{get_unique_string()}')),
+            id=JoinId(NodeId(node_id)),
             reducer_factory=reducer_factory,
         )
 
     @staticmethod
-    def decision(id: str | None) -> Decision[StateT, DepsT, Never, Never]:
-        # TODO: Generate a deterministic node ID and/or require it be provided.
-        #   It's probably enough to generate a name as a function of how many nodes have been created,
-        #   noting that if you want repeatability you should always specify the node ID
-        return Decision[StateT, DepsT, Never, Never](id=NodeId(id or '-'), branches=[])
+    def decision(*, node_id: str | None = None) -> Decision[StateT, DepsT, Never, Never]:
+        if node_id is None:
+            node_id = f'decision-{get_unique_string()}'
+        return Decision[StateT, DepsT, Never, Never](id=NodeId(node_id), branches=[])
 
     # TODO: Add a method more closely related to edge building that accepts the input node as a way to get a type-checked input
     #   Alternatively, add InputT as a type on Decision, and include it in the output of DecisionBranchBuilder, and do type-checking of it.
     def handle[SourceT](
-        self, case: type[SourceT], matches: Callable[[Any], bool] | None = None
+        self, case: type[SourceT], *, matches: Callable[[Any], bool] | None = None, label: str | None = None
     ) -> DecisionBranchBuilder[StateT, DepsT, SourceT, Any, SourceT]:
-        return DecisionBranchBuilder(case, matches, transforms=())
+        return DecisionBranchBuilder(case, matches, transforms=(), user_label=label)
 
     # note: forks are built by calls to `xyz_spread`, by calling `start_with` multiple times, or by calling `edge` multiple times with the same source
 
@@ -109,7 +131,12 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
     # Node "types" to be connected into edges: 'start', 'end', Step, Decision, Join, Fork.
     # You typically don't manually create forks — they are inferred from multiple edges coming out of a single node.
     @overload
-    def start_with(self, destination: Destination[GraphInputT]) -> None: ...
+    def start_with(
+        self,
+        destination: Destination[GraphInputT],
+        *,
+        label: str | None = None,
+    ) -> None: ...
 
     @overload
     def start_with[DestinationInputT](
@@ -117,6 +144,7 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         destination: Destination[DestinationInputT],
         *,
         transform: TransformFunction[StateT, DepsT, GraphInputT, GraphInputT, DestinationInputT],
+        label: str | None = None,
     ) -> None: ...
 
     def start_with(
@@ -124,17 +152,22 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         destination: Destination[Any],
         *,
         transform: TransformFunction[StateT, DepsT, Any, Any, Any] | None = None,
+        label: str | None = None,
     ) -> None:
         self._add_edge_from_nodes(
             source=START,
             transform=transform,
             destination=destination,
+            label=label,
         )
 
     @overload
     def start_with_spread[GraphInputItemT](
         self: GraphBuilder[StateT, DepsT, Sequence[GraphInputItemT], GraphOutputT],
         node: Destination[GraphInputItemT],
+        *,
+        pre_spread_label: str | None = None,
+        post_spread_label: str | None = None,
     ) -> None: ...
 
     @overload
@@ -143,6 +176,8 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         node: Destination[DestinationInputT],
         *,
         pre_spread_transform: TransformFunction[StateT, DepsT, GraphInputT, GraphInputT, Sequence[DestinationInputT]],
+        pre_spread_label: str | None = None,
+        post_spread_label: str | None = None,
     ) -> None: ...
 
     @overload
@@ -153,6 +188,8 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         post_spread_transform: TransformFunction[
             StateT, DepsT, Sequence[GraphInputItemT], GraphInputItemT, DestinationInputT
         ],
+        pre_spread_label: str | None = None,
+        post_spread_label: str | None = None,
     ) -> None: ...
 
     @overload
@@ -162,6 +199,8 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         *,
         pre_spread_transform: TransformFunction[StateT, DepsT, GraphInputT, GraphInputT, Sequence[IntermediateT]],
         post_spread_transform: TransformFunction[StateT, DepsT, GraphInputT, IntermediateT, DestinationInputT],
+        pre_spread_label: str | None = None,
+        post_spread_label: str | None = None,
     ) -> None: ...
 
     def start_with_spread(
@@ -170,6 +209,8 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         *,
         pre_spread_transform: TransformFunction[StateT, DepsT, Any, Any, Sequence[Any]] | None = None,
         post_spread_transform: TransformFunction[StateT, DepsT, Any, Any, Any] | None = None,
+        pre_spread_label: str | None = None,
+        post_spread_label: str | None = None,
     ) -> None:
         # TODO: Need to allow specifying the id manually to prevent conflicts if there are multiple spreads between the same two nodes
         spread = Spread(id=get_default_spread_id(START, node))
@@ -177,15 +218,23 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
             source=START,
             transform=pre_spread_transform,
             destination=spread,
+            label=pre_spread_label,
         )
         self._add_edge_from_nodes(
             source=spread,
             transform=post_spread_transform,
             destination=node,
+            label=post_spread_label,
         )
 
     @overload
-    def edge[SourceOutputT](self, source: Source[SourceOutputT], destination: Destination[SourceOutputT]) -> None: ...
+    def edge[SourceOutputT](
+        self,
+        source: Source[SourceOutputT],
+        destination: Destination[SourceOutputT],
+        *,
+        label: str | None = None,
+    ) -> None: ...
 
     @overload
     def edge[SourceInputT, SourceOutputT, DestinationInputT](
@@ -194,6 +243,7 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         destination: Destination[DestinationInputT],
         *,
         transform: TransformFunction[StateT, DepsT, SourceInputT, SourceOutputT, DestinationInputT],
+        label: str | None = None,
     ) -> None: ...
 
     def edge(
@@ -202,11 +252,13 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         destination: Destination[Any],
         *,
         transform: AnyTransformFunction | None = None,
+        label: str | None = None,
     ) -> None:
         self._add_edge_from_nodes(
             source=source,
             transform=transform,
             destination=destination,
+            label=label,
         )
 
     @overload
@@ -214,6 +266,9 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         self,
         source: SourceWithInputs[SourceInputT, Sequence[DestinationInputT]],
         destination: Destination[DestinationInputT],
+        *,
+        pre_spread_label: str | None = None,
+        post_spread_label: str | None = None,
     ) -> None: ...
 
     @overload
@@ -225,6 +280,8 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         pre_spread_transform: TransformFunction[
             StateT, DepsT, SourceInputT, SourceOutputT, Sequence[DestinationInputT]
         ],
+        pre_spread_label: str | None = None,
+        post_spread_label: str | None = None,
     ) -> None: ...
 
     @overload
@@ -240,6 +297,8 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
             SourceOutputItemT,
             DestinationInputT,
         ],
+        pre_spread_label: str | None = None,
+        post_spread_label: str | None = None,
     ) -> None: ...
 
     @overload
@@ -250,6 +309,8 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         *,
         pre_spread_transform: TransformFunction[StateT, DepsT, SourceInputT, SourceOutputT, Sequence[IntermediateT]],
         post_spread_transform: TransformFunction[StateT, DepsT, SourceInputT, IntermediateT, DestinationInputT],
+        pre_spread_label: str | None = None,
+        post_spread_label: str | None = None,
     ) -> None: ...
 
     def spreading_edge[SourceInputT](
@@ -259,6 +320,8 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         *,
         pre_spread_transform: TransformFunction[StateT, DepsT, SourceInputT, Any, Sequence[Any]] | None = None,
         post_spread_transform: TransformFunction[StateT, DepsT, SourceInputT, Any, Any] | None = None,
+        pre_spread_label: str | None = None,
+        post_spread_label: str | None = None,
     ) -> None:
         # TODO: Need to allow specifying the id manually to prevent conflicts if there are multiple spreads between the same two nodes
         fork = Spread(id=get_default_spread_id(source, destination))
@@ -266,21 +329,29 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
             source=source,
             transform=pre_spread_transform,
             destination=fork,
+            label=pre_spread_label,
         )
         self._add_edge_from_nodes(
             source=fork,
             transform=post_spread_transform,
             destination=destination,
+            label=post_spread_label,
         )
 
     @overload
-    def end_from(self, source: Source[GraphOutputT]) -> None: ...
+    def end_from(
+        self,
+        source: Source[GraphOutputT],
+        *,
+        label: str | None = None,
+    ) -> None: ...
 
     @overload
     def end_from[SourceInputT, SourceOutputT](
         self,
         source: SourceWithInputs[SourceInputT, SourceOutputT],
         *,
+        label: str | None = None,
         transform: TransformFunction[StateT, DepsT, SourceInputT, SourceOutputT, GraphOutputT],
     ) -> None: ...
 
@@ -288,12 +359,14 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         self,
         source: Source[Any],
         *,
+        label: str | None = None,
         transform: TransformFunction[StateT, DepsT, Any, Any, GraphOutputT] | None = None,
     ) -> None:
         self._add_edge_from_nodes(
             source=source,
             transform=transform,
             destination=END,
+            label=label,
         )
 
     def _add_edge_from_nodes(
@@ -302,11 +375,12 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         source: AnySourceNode,
         transform: AnyTransformFunction | None,
         destination: AnyDestinationNode,
+        label: str | None = None,
     ) -> None:
         self._add_node(source)
         self._add_node(destination)
 
-        edge = Edge(source_id=source.id, transform=transform, destination_id=destination.id)
+        edge = Edge(source_id=source.id, transform=transform, destination_id=destination.id, user_label=label)
         self._add_edge(edge)
 
     def _add_node(self, node: AnyNode) -> None:
@@ -334,16 +408,20 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         nodes = self._nodes
         edges = self._edges_by_source
         nodes, edges = _convert_decision_spreads(nodes, edges)
-        dominating_forks = _collect_dominating_forks(nodes, edges)
+        parent_forks = _collect_dominating_forks(nodes, edges)
+
+        output_type = cast(type[GraphOutputT], self.output_type)
+        if get_origin(output_type) is TypeUnion:
+            output_type = get_args(output_type)[0]
 
         return Graph[StateT, DepsT, GraphInputT, GraphOutputT](
             state_type=self.state_type,
             deps_type=self.deps_type,
             input_type=self.input_type,
-            output_type=self.output_type,
+            output_type=output_type,
             nodes=self._nodes,
             edges_by_source=self._edges_by_source,
-            dominating_forks=dominating_forks,
+            parent_forks=parent_forks,
         )
 
 
@@ -369,6 +447,7 @@ def _convert_decision_spreads(
                             source_id=spread.id,
                             transform=branch.post_spread_transform,
                             destination_id=old_route_to.id,
+                            user_label=branch.post_spread_user_label,
                         )
                     )
                     branch.route_to = spread
@@ -405,7 +484,7 @@ def _collect_dominating_forks(
     return dominating_forks
 
 
-@dataclass
+@dataclass(repr=False)
 class Graph[StateT, DepsT, InputT, OutputT]:
     state_type: type[StateT]
     deps_type: type[DepsT]
@@ -414,17 +493,26 @@ class Graph[StateT, DepsT, InputT, OutputT]:
 
     nodes: dict[NodeId, AnyNode]
     edges_by_source: dict[NodeId, list[Edge]]
-    dominating_forks: dict[JoinId, ParentFork[NodeId]]  # mapping from join node to the dominating fork
+    parent_forks: dict[JoinId, ParentFork[NodeId]]
 
     @property
     def start_edges(self) -> list[Edge]:
         return self.edges_by_source.get(START.id, [])
 
-    def get_dominating_fork(self, join_id: JoinId) -> ParentFork[NodeId]:
-        result = self.dominating_forks.get(join_id)
+    def get_parent_fork(self, join_id: JoinId) -> ParentFork[NodeId]:
+        result = self.parent_forks.get(join_id)
         if result is None:
             raise RuntimeError(f'Node {join_id} is not a join node or did not have a dominating fork (this is a bug)')
         return result
+
+    async def run(self, state: StateT, deps: DepsT, inputs: InputT) -> OutputT:
+        return await GraphRun(self, state, deps, inputs).run()
+
+    def render(self, *, title: str | None = None, direction: StateDiagramDirection | None = None) -> str:
+        return generate_code(self, title=title, direction=direction)
+
+    def __repr__(self):
+        return self.render()
 
 
 @dataclass
@@ -453,25 +541,28 @@ class Some[T]:
 type Maybe[T] = Some[T] | None  # like optional, but you can tell the difference between "no value" and "value is None"
 
 
-@dataclass
+@dataclass(init=False)
 class GraphRun[StateT, DepsT, InputT, OutputT]:
     graph: Graph[StateT, DepsT, InputT, OutputT]
     state: StateT
     deps: DepsT
     inputs: InputT
 
-    result: Maybe[OutputT] = None
-    active_walks: list[GraphWalkState] = field(init=False)
-
-    active_reducers: dict[tuple[NodeId, NodeRunId], Reducer[StateT, DepsT, Any, Any]] = field(init=False)
-    """The node id is for the join, the node run id is for the dominating fork."""
     # persistence: Any  # TODO: Implement use of this
 
-    def __post_init__(self):
-        self.active_walks = [
+    def __init__(self, graph: Graph[StateT, DepsT, InputT, OutputT], state: StateT, deps: DepsT, inputs: InputT):
+        self.graph = graph
+        self.state = state
+        self.deps = deps
+        self.inputs = inputs
+
+        self.result: Maybe[OutputT] = None
+        self.active_walks: list[GraphWalkState] = [
             GraphWalkState(node_id=START.id, context_inputs=self.inputs, node_inputs=self.inputs, fork_stack=())
         ]
-        self.active_reducers = {}
+
+        self.active_reducers: dict[tuple[NodeId, NodeRunId], Reducer[StateT, DepsT, Any, Any]] = {}
+        """The node id is for the join, the node run id is for the dominating fork."""
 
     async def run(self):
         # TODO: Refactor this to actually run distinct walks in parallel in the async event loop using a task group
@@ -501,7 +592,7 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
                 'Graph run completed, but no result was produced. This is either a bug in the graph or a bug in the graph runner.'
             )
 
-        return self.result
+        return self.result.value
 
     def _handle_start(self, walk: GraphWalkState) -> None:
         # nothing to do besides start the graph
@@ -514,7 +605,7 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
 
     def _handle_reduce_join(self, join: Join[Any, Any, Any, Any], walk: GraphWalkState) -> None:
         # Find the matching fork run id in the stack; this will be used to look for an active reducer
-        parent_fork = self.graph.get_dominating_fork(join.id)
+        parent_fork = self.graph.get_parent_fork(join.id)
         matching_fork_run_id = next(iter(x[1] for x in walk.fork_stack[::-1] if x[0] == parent_fork.fork_id), None)
         if matching_fork_run_id is None:
             raise RuntimeError(

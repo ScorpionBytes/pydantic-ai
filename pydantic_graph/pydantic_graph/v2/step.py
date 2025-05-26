@@ -42,3 +42,8 @@ class StepCallProtocol[StateT, DepsT, InputT, OutputT](Protocol):
 class Step[StateT, DepsT, InputT, OutputT]:
     id: NodeId
     call: StepCallProtocol[StateT, DepsT, InputT, OutputT]
+    user_label: str | None
+
+    @property
+    def label(self) -> str | None:
+        return self.user_label

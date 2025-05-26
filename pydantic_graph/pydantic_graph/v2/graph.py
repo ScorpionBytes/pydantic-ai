@@ -312,6 +312,7 @@ class GraphBuilder[StateT, GraphInputT, GraphOutputT]:
 
     def build(self) -> Graph[StateT, GraphInputT, GraphOutputT]:
         # TODO: Warn/error if the graph is not connected
+        # TODO: Warn/error if any non-End node is a dead end
         # TODO: Error if the graph does not meet the every-join-has-a-source-fork requirement (otherwise can't know when to proceed past joins)
         # TODO: Convert decisions with spreads into "normal" spreads
         # TODO: Allow the user to specify the dominating forks; only infer them if _not_ specified
@@ -519,8 +520,7 @@ class GraphRun[StateT, InputT, OutputT]:
 
     def _handle_decision(self, decision: Decision[Any, Any], walk: GraphWalkState) -> None:
         for branch in decision.branches:
-            # TODO: Need to convert decision branches into spreads during graph building ... otherwise can't use graph analysis
-            assert not branch.spread
+            assert not branch.spread, 'Spreads decisions should be converted into spreads as part of graph-building'
 
             match_tester = branch.matches
             if match_tester is not None:
@@ -531,7 +531,10 @@ class GraphRun[StateT, InputT, OutputT]:
                 inputs_match = isinstance(walk.node_inputs, branch.source)
 
             if inputs_match:
-                # TODO: Need to apply transforms as required by the EdgeBranch; not yet implemented
+                node_inputs = walk.node_inputs
+                for transform in branch.transforms:
+                    ctx = TransformContext(self.state, walk.context_inputs, node_inputs)
+                    node_inputs = transform(ctx)
                 self.active_walks.append(
                     GraphWalkState(branch.route_to.id, walk.context_inputs, walk.node_inputs, walk.fork_stack)
                 )

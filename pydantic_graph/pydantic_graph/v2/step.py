@@ -37,12 +37,3 @@ class StepCallProtocol[StateT, InputT, OutputT](Protocol):
 class Step[StateT, InputT, OutputT]:
     id: NodeId
     call: StepCallProtocol[StateT, InputT, OutputT]
-
-    # async def run(self, ctx: NodeContext[StateT, InputT]) -> OutputT:
-    #     raise NotImplementedError
-    #
-    # def with_transformed_inputs[NewInputT](self, transform: Callable[[NewInputT], InputT]) -> Step[StateT, NewInputT, OutputT]:
-    #     raise NotImplementedError
-    #
-    # def with_transformed_output[NewOutputT](self, transform: Callable[[OutputT], NewOutputT]) -> Step[StateT, InputT, NewOutputT]:
-    #     raise NotImplementedError

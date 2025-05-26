@@ -14,6 +14,7 @@ Need to be able to:
 * Interruption
     * Implementation 1: if persistence is necessary, return an Interrupt, and use the `resume` API to continue. Note that you need to snapshot graph state (including all GraphWalkers) to resume
     * Implementation 2: if persistence is not necessary and the implementation can just wait, use channels
+* Iteration API (?)
 * Command (?)
 * Persistence (???) — how should this work with multiple GraphWalkers?
 """

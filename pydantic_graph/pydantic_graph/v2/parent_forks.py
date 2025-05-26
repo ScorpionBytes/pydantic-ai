@@ -1,3 +1,10 @@
+"""TODO: Explain what a "parent fork" is, how it relates to dominating forks, and why we need this.
+
+In particular, explain the relationship to avoiding deadlocks, and that for most typical graphs such a
+dominating fork does exist. Also explain how when there are multiple subsequent forks the preferred choice
+could be ambiguous, and that in some cases it should/must be specified by the control flow graph designer.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Hashable
@@ -7,10 +14,10 @@ from functools import cached_property
 
 
 @dataclass
-class DominatingFork[T: Hashable]:
+class ParentFork[T: Hashable]:
     fork_id: T
     intermediate_nodes: set[T]
-    """The set of node IDs of nodes upstream of the join and downstream of the dominating fork.
+    """The set of node IDs of nodes upstream of the join and downstream of the parent fork.
     
     If there are no graph walkers in these nodes that were a part of a previous fork, it is safe to proceed downstream
     of the join.
@@ -18,21 +25,21 @@ class DominatingFork[T: Hashable]:
 
 
 @dataclass
-class DominatingForkFinder[T: Hashable]:
+class ParentForkFinder[T: Hashable]:
     nodes: set[T]
     start_ids: set[T]
     fork_ids: set[T]
     edges: dict[T, list[T]]  # source_id to list of destination_ids
 
-    def find_dominating_fork(self, join_id: T) -> DominatingFork[T] | None:
-        """Return the *closest* dominating fork of the join, together with the set of
+    def find_parent_fork(self, join_id: T) -> ParentFork[T] | None:
+        """Return the *closest* parent fork of the join, together with the set of
         nodes that lie strictly between that fork and the join.
 
-        If every dominating fork lets J participate in a cycle that avoids the
-        fork, return **None** (no safe “dominating fork” exists).
+        If every dominating fork of J lets J participate in a cycle that avoids the
+        fork, return `None`, since that means no "parent fork" exists.
         """
         visited: set[str] = set()
-        cur = join_id  # start at J and walk up the idom chain
+        cur = join_id  # start at J and walk up the immediate dominator chain
         while True:
             cur = self._immediate_dominator(cur)
             if cur is None:  # reached the root
@@ -45,11 +52,11 @@ class DominatingForkFinder[T: Hashable]:
             if cur not in self.fork_ids:
                 continue  # not a fork, so keep climbing
 
-            upstream_nodes = self._get_upstream_nodes(join_id, cur)
+            upstream_nodes = self._get_upstream_nodes_if_parent(join_id, cur)
             if upstream_nodes is not None:  # found upstream nodes without a cycle
-                return DominatingFork[T](cur, upstream_nodes)
+                return ParentFork[T](cur, upstream_nodes)
 
-        # No dominating fork passed the cycle test
+        # No dominating fork passed the cycle test to be a "parent" fork
         return None
 
     @cached_property
@@ -92,13 +99,13 @@ class DominatingForkFinder[T: Hashable]:
                 return c
         return None
 
-    def _get_upstream_nodes(self, join_id: T, fork_id: T) -> set[T] | None:  # ←  None  ==> cycle exists
+    def _get_upstream_nodes_if_parent(self, join_id: T, fork_id: T) -> set[T] | None:
         """Return the set of node‑ids that can reach the join (J) in the graph where
         the node `fork_id` is removed.
 
         If, in that pruned graph, a path exists that starts and ends at J
         (i.e. J is on a cycle that avoids the provided node) we return `None` instead,
-        because the fork would *not* be a valid "dominating fork".
+        because the fork would not be a valid "parent fork".
         """
         upstream: set[T] = set()
         stack = [join_id]
@@ -133,9 +140,9 @@ def main_test():
     invalid_edges = deepcopy(valid_edges)
     invalid_edges['C'].append('A')
 
-    print(DominatingForkFinder(nodes, start_ids, fork_ids, valid_edges).find_dominating_fork(join_id))
+    print(ParentForkFinder(nodes, start_ids, fork_ids, valid_edges).find_parent_fork(join_id))
     # > DominatingFork(fork_id='F', intermediate_nodes={'A', 'B'})
-    print(DominatingForkFinder(nodes, start_ids, fork_ids, invalid_edges).find_dominating_fork(join_id))
+    print(ParentForkFinder(nodes, start_ids, fork_ids, invalid_edges).find_parent_fork(join_id))
     # > None
 
 

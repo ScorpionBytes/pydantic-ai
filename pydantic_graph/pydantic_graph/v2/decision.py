@@ -10,11 +10,13 @@ from pydantic_graph.v2.transform import TransformFunction
 
 
 @dataclass
-class Decision[SourceT, EndT]:
+class Decision[StateT, DepsT, SourceT, EndT]:
     id: NodeId
-    branches: list[DecisionBranch[Any, Any]]
+    branches: list[DecisionBranch[StateT, DepsT, Any, Any]]
 
-    def with_branch[S, E, S2, E2](self: Decision[S, E], branch: DecisionBranch[S2, E2]) -> Decision[S | S2, E | E2]:
+    def with_branch[S, E, S2, E2](
+        self: Decision[StateT, DepsT, S, E], branch: DecisionBranch[StateT, DepsT, S2, E2]
+    ) -> Decision[StateT, DepsT, S | S2, E | E2]:
         return Decision(id=self.id, branches=self.branches + [branch])
 
     def _force_source_invariant(self, source: SourceT) -> SourceT:
@@ -25,34 +27,35 @@ class Decision[SourceT, EndT]:
 
 
 @dataclass
-class DecisionBranch[SourceT, EndT]:
+class DecisionBranch[StateT, DepsT, SourceT, EndT]:
     source: type[SourceT]
     route_to: AnyDestinationNode
     # TODO: Rename `matches` to `test_match` or similar
     matches: Callable[[Any], bool] | None = None
-    transforms: tuple[TransformFunction[Any, Any, Any, Any, Any], ...] = ()
+    # TODO: If we change `transforms` to a single callable, we can make SourceT the type of the inputs
+    transforms: tuple[TransformFunction[StateT, DepsT, Any, Any, Any], ...] = ()
     # TODO: the branch needs a node ID to use as the ID of the spread node
     spread: bool = False
-    post_spread_transform: TransformFunction[Any, Any, Any, Any, Any] | None = None
+    post_spread_transform: TransformFunction[StateT, DepsT, Any, Any, Any] | None = None
 
 
 @dataclass
-class DecisionBranchBuilder[SourceT, GraphStateT, DepsT, EdgeInputT, EdgeOutputT]:
+class DecisionBranchBuilder[StateT, DepsT, SourceT, EdgeInputT, EdgeOutputT]:
     source: type[SourceT]
     matches: Callable[[Any], bool] | None = None
-    transforms: tuple[TransformFunction[GraphStateT, DepsT, EdgeInputT, Any, Any], ...] = ()
+    transforms: tuple[TransformFunction[StateT, DepsT, EdgeInputT, Any, Any], ...] = ()
 
     def transform[T](
         self,
-        call: TransformFunction[GraphStateT, DepsT, EdgeInputT, EdgeOutputT, T],
-    ) -> DecisionBranchBuilder[SourceT, GraphStateT, DepsT, EdgeInputT, T]:
+        call: TransformFunction[StateT, DepsT, EdgeInputT, EdgeOutputT, T],
+    ) -> DecisionBranchBuilder[StateT, DepsT, SourceT, EdgeInputT, T]:
         new_transforms = self.transforms + (call,)
         return DecisionBranchBuilder(self.source, self.matches, new_transforms)
 
     def route_to(  # analogous to GraphBuilder.edge
         self, node: AnyDestinationNode
-    ) -> DecisionBranch[SourceT, Never]:
-        return DecisionBranch[SourceT, Never](
+    ) -> DecisionBranch[StateT, DepsT, SourceT, Never]:
+        return DecisionBranch[StateT, DepsT, SourceT, Never](
             source=self.source,
             route_to=node,
             matches=self.matches,
@@ -60,11 +63,11 @@ class DecisionBranchBuilder[SourceT, GraphStateT, DepsT, EdgeInputT, EdgeOutputT
         )
 
     def spread_to[T](  # analogous to GraphBuilder.spreading_edge
-        self: DecisionBranchBuilder[SourceT, GraphStateT, DepsT, EdgeInputT, Sequence[T]],
+        self: DecisionBranchBuilder[StateT, DepsT, SourceT, EdgeInputT, Sequence[T]],
         node: AnyDestinationNode,
-        post_spread_transform: TransformFunction[GraphStateT, DepsT, Sequence[T], Any, Any] | None,
-    ) -> DecisionBranch[SourceT, Never]:
-        return DecisionBranch[SourceT, Never](
+        post_spread_transform: TransformFunction[StateT, DepsT, Sequence[T], Any, Any] | None,
+    ) -> DecisionBranch[StateT, DepsT, SourceT, Never]:
+        return DecisionBranch[StateT, DepsT, SourceT, Never](
             source=self.source,
             route_to=node,
             matches=self.matches,
@@ -75,7 +78,7 @@ class DecisionBranchBuilder[SourceT, GraphStateT, DepsT, EdgeInputT, EdgeOutputT
 
     def end(
         self,
-    ) -> DecisionBranch[SourceT, EdgeOutputT]:
+    ) -> DecisionBranch[StateT, DepsT, SourceT, EdgeOutputT]:
         return DecisionBranch(
             source=self.source,
             route_to=EndNode.end,

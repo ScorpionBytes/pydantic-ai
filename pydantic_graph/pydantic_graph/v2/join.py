@@ -34,15 +34,15 @@ class ReducerContext[StateT, DepsT, InputT]:
         return f'{self.__class__.__name__}(state={self.state}, deps={self.deps}, inputs={self.inputs})'
 
 
-class Reducer[GraphStateT, DepsT, InputT, OutputT]:
-    def __init__(self, state: GraphStateT, deps: DepsT, inputs: InputT):
+class Reducer[StateT, DepsT, InputT, OutputT]:
+    def __init__(self, state: StateT, deps: DepsT, inputs: InputT):
         self._state = state
         self._deps = deps
 
-    def reduce(self, ctx: ReducerContext[GraphStateT, DepsT, InputT]) -> None:
+    def reduce(self, ctx: ReducerContext[StateT, DepsT, InputT]) -> None:
         raise NotImplementedError
 
-    def finalize(self, ctx: ReducerContext[GraphStateT, DepsT, None]) -> OutputT:
+    def finalize(self, ctx: ReducerContext[StateT, DepsT, None]) -> OutputT:
         raise NotImplementedError
 
 
@@ -69,6 +69,5 @@ class Join[StateT, DepsT, InputT, OutputT]:
 
     reducer_factory: ReducerFactory[StateT, DepsT, InputT, OutputT]
 
-    # TODO: Need to implement a version of DominatingForkFinder that validates the specified NodeId is valid
-    # Maybe should call this "parent_fork" or similar..
+    # TODO: Need to implement a version of ParentForkFinder that validates the specified NodeId is valid
     joins: ForkId | None = None  # the NodeID of the node to use as the dominating fork

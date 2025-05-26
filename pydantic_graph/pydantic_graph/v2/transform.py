@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class TransformContext[StateT, DepsT, InputT, OutputT]:
@@ -35,3 +35,6 @@ class TransformContext[StateT, DepsT, InputT, OutputT]:
 class TransformFunction[StateT, DepsT, SourceInputT, SourceOutputT, DestinationInputT](Protocol):
     def __call__(self, ctx: TransformContext[StateT, DepsT, SourceInputT, SourceOutputT]) -> DestinationInputT:
         raise NotImplementedError
+
+
+type AnyTransformFunction = TransformFunction[Any, Any, Any, Any, Any]

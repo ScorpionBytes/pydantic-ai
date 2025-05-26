@@ -9,7 +9,6 @@ from typing import Any, Callable, Never, overload
 from typing_extensions import assert_never
 
 from pydantic_graph.v2.decision import Decision, DecisionBranchBuilder
-from pydantic_graph.v2.dominating_forks import DominatingFork, DominatingForkFinder
 from pydantic_graph.v2.id_types import ForkId, JoinId, NodeRunId
 from pydantic_graph.v2.join import Join, Reducer, ReducerContext
 from pydantic_graph.v2.node import (
@@ -20,21 +19,22 @@ from pydantic_graph.v2.node import (
     AnySourceNode,
     EndNode,
     NodeId,
+    Spread,
     StartNode,
     get_default_spread_id,
     is_destination,
     is_source,
 )
-from pydantic_graph.v2.spread import Spread
+from pydantic_graph.v2.parent_forks import ParentFork, ParentForkFinder
 from pydantic_graph.v2.step import Step, StepCallProtocol, StepContext
-from pydantic_graph.v2.transform import TransformContext, TransformFunction
+from pydantic_graph.v2.transform import AnyTransformFunction, TransformContext, TransformFunction
 from pydantic_graph.v2.util import get_callable_name, get_unique_string
 
 
 @dataclass
 class Edge:
     source_id: NodeId
-    transform: TransformFunction[Any, Any, Any, Any, Any] | None
+    transform: AnyTransformFunction | None
     destination_id: NodeId
 
     def source(self, nodes: dict[NodeId, AnyNode]) -> AnySourceNode:
@@ -67,7 +67,9 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
     type Source[OutputT] = Step[StateT, DepsT, Any, OutputT] | Join[StateT, DepsT, Any, OutputT]
     type SourceWithInputs[InputT, OutputT] = Step[StateT, DepsT, InputT, OutputT] | Join[StateT, DepsT, InputT, OutputT]
     type Destination[InputT] = (
-        Step[StateT, DepsT, InputT, Any] | Join[StateT, DepsT, InputT, Any] | Decision[InputT, GraphOutputT]
+        Step[StateT, DepsT, InputT, Any]
+        | Join[StateT, DepsT, InputT, Any]
+        | Decision[StateT, DepsT, InputT, GraphOutputT]
     )
 
     # Node building:
@@ -88,17 +90,17 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         )
 
     @staticmethod
-    def decision(id: str | None) -> Decision[Never, Never]:
+    def decision(id: str | None) -> Decision[StateT, DepsT, Never, Never]:
         # TODO: Generate a deterministic node ID and/or require it be provided.
         #   It's probably enough to generate a name as a function of how many nodes have been created,
         #   noting that if you want repeatability you should always specify the node ID
-        return Decision[Never, Never](id=NodeId(id or '-'), branches=[])
+        return Decision[StateT, DepsT, Never, Never](id=NodeId(id or '-'), branches=[])
 
     # TODO: Add a method more closely related to edge building that accepts the input node as a way to get a type-checked input
     #   Alternatively, add InputT as a type on Decision, and include it in the output of DecisionBranchBuilder, and do type-checking of it.
     def handle[SourceT](
         self, case: type[SourceT], matches: Callable[[Any], bool] | None = None
-    ) -> DecisionBranchBuilder[SourceT, StateT, DepsT, Any, SourceT]:
+    ) -> DecisionBranchBuilder[StateT, DepsT, SourceT, Any, SourceT]:
         return DecisionBranchBuilder(case, matches, transforms=())
 
     # note: forks are built by calls to `xyz_spread`, by calling `start_with` multiple times, or by calling `edge` multiple times with the same source
@@ -170,7 +172,7 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         post_spread_transform: TransformFunction[StateT, DepsT, Any, Any, Any] | None = None,
     ) -> None:
         # TODO: Need to allow specifying the id manually to prevent conflicts if there are multiple spreads between the same two nodes
-        spread = Spread[Any, Any, Any, Any](id=get_default_spread_id(START, node))
+        spread = Spread(id=get_default_spread_id(START, node))
         self._add_edge_from_nodes(
             source=START,
             transform=pre_spread_transform,
@@ -199,7 +201,7 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         source: Source[Any],
         destination: Destination[Any],
         *,
-        transform: TransformFunction[Any, Any, Any, Any, Any] | None = None,
+        transform: AnyTransformFunction | None = None,
     ) -> None:
         self._add_edge_from_nodes(
             source=source,
@@ -259,9 +261,7 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         post_spread_transform: TransformFunction[StateT, DepsT, SourceInputT, Any, Any] | None = None,
     ) -> None:
         # TODO: Need to allow specifying the id manually to prevent conflicts if there are multiple spreads between the same two nodes
-        fork = Spread[Any, Any, Any, Any](
-            id=get_default_spread_id(source, destination),
-        )
+        fork = Spread(id=get_default_spread_id(source, destination))
         self._add_edge_from_nodes(
             source=source,
             transform=pre_spread_transform,
@@ -300,7 +300,7 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         self,
         *,
         source: AnySourceNode,
-        transform: TransformFunction[Any, Any, Any, Any, Any] | None,
+        transform: AnyTransformFunction | None,
         destination: AnyDestinationNode,
     ) -> None:
         self._add_node(source)
@@ -361,7 +361,7 @@ def _convert_decision_spreads(
         if isinstance(node, Decision):
             for branch in node.branches:
                 if branch.spread:
-                    spread = Spread[Any, Any, Any, Any](id=ForkId(NodeId(f'spread:{branch.route_to.id}')))
+                    spread = Spread(id=ForkId(NodeId(f'spread:{branch.route_to.id}')))
                     old_route_to = branch.route_to
                     nodes[spread.id] = spread
                     edges[spread.id].append(
@@ -379,14 +379,14 @@ def _convert_decision_spreads(
 
 def _collect_dominating_forks(
     graph_nodes: dict[NodeId, AnyNode], graph_edges_by_source: dict[NodeId, list[Edge]]
-) -> dict[JoinId, DominatingFork[NodeId]]:
+) -> dict[JoinId, ParentFork[NodeId]]:
     nodes = set(graph_nodes)
     start_ids = {StartNode.start.id}
     edges = {source_id: [e.destination_id for e in graph_edges_by_source[source_id]] for source_id in nodes}
     fork_ids = {
         node_id for node_id, node in graph_nodes.items() if isinstance(node, Spread) or len(edges.get(node_id, [])) > 1
     }
-    finder = DominatingForkFinder(
+    finder = ParentForkFinder(
         nodes=nodes,
         start_ids=start_ids,
         fork_ids=fork_ids,
@@ -394,9 +394,9 @@ def _collect_dominating_forks(
     )
 
     join_ids = {node.id for node in graph_nodes.values() if isinstance(node, Join)}
-    dominating_forks: dict[JoinId, DominatingFork[NodeId]] = {}
+    dominating_forks: dict[JoinId, ParentFork[NodeId]] = {}
     for join_id in join_ids:
-        dominating_fork = finder.find_dominating_fork(join_id)
+        dominating_fork = finder.find_parent_fork(join_id)
         if dominating_fork is None:
             # TODO: Print out the mermaid graph and explain the problem
             raise ValueError(f'Join node {join_id} has no dominating fork')
@@ -414,13 +414,13 @@ class Graph[StateT, DepsT, InputT, OutputT]:
 
     nodes: dict[NodeId, AnyNode]
     edges_by_source: dict[NodeId, list[Edge]]
-    dominating_forks: dict[JoinId, DominatingFork[NodeId]]  # mapping from join node to the dominating fork
+    dominating_forks: dict[JoinId, ParentFork[NodeId]]  # mapping from join node to the dominating fork
 
     @property
     def start_edges(self) -> list[Edge]:
         return self.edges_by_source.get(START.id, [])
 
-    def get_dominating_fork(self, join_id: JoinId) -> DominatingFork[NodeId]:
+    def get_dominating_fork(self, join_id: JoinId) -> ParentFork[NodeId]:
         result = self.dominating_forks.get(join_id)
         if result is None:
             raise RuntimeError(f'Node {join_id} is not a join node or did not have a dominating fork (this is a bug)')
@@ -444,6 +444,7 @@ class GraphWalkState:
     """
 
 
+# TODO: Move `Some` and `Maybe` to util?
 @dataclass
 class Some[T]:
     value: T
@@ -533,7 +534,7 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
     def _handle_spread(self, walk: GraphWalkState):
         self._handle_edges(walk, walk.context_inputs, walk.node_inputs)
 
-    def _handle_decision(self, decision: Decision[Any, Any], walk: GraphWalkState) -> None:
+    def _handle_decision(self, decision: Decision[StateT, DepsT, Any, Any], walk: GraphWalkState) -> None:
         for branch in decision.branches:
             assert not branch.spread, 'Spreads decisions should be converted into spreads as part of graph-building'
 

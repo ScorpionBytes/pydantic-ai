@@ -3,7 +3,7 @@
 - Graphs need a way to specify whether to end eagerly or after all forked tasks complete finished
     - In the non-eager case, graph needs a way to specify a reducer for multiple entries to g.end()
         - Default is ignore and warn after the first, but a reducer _can_ be used
-    - I think the general case should be a JoinNode[GraphStateT, GraphOutputT, GraphOutputT, Any]
+    - I think the general case should be a JoinNode[StateT, GraphOutputT, GraphOutputT, Any]
 
 Need to be able to:
 * Decision (deterministically decide which node to transition to based on the input, possibly the input type)

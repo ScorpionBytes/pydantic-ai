@@ -46,4 +46,4 @@ def is_destination(node: AnyNode) -> TypeGuard[AnyDestinationNode]:
 
 
 def get_default_spread_id(source: AnySourceNode, destination: AnyDestinationNode) -> ForkId:
-    return ForkId(f'__spread__:{source.id}:{destination.id}')
+    return ForkId(NodeId(f'__spread__:{source.id}:{destination.id}'))

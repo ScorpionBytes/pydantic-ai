@@ -84,8 +84,11 @@ class GraphBuilder[StateT, GraphInputT, GraphOutputT]:
         )
 
     @staticmethod
-    def decision() -> Decision[Never, Never]:
-        raise NotImplementedError
+    def decision(id: str | None) -> Decision[Never, Never]:
+        # TODO: Generate a deterministic node ID and/or require it be provided.
+        #   It's probably enough to generate a name as a function of how many nodes have been created,
+        #   noting that if you want repeatability you should always specify the node ID
+        return Decision[Never, Never](id=NodeId(id or '-'), branches=[])
 
     # note: forks are built by calls to `xyz_spread`, by calling `start_with` multiple times, or by calling `edge` multiple times with the same source
 
@@ -308,14 +311,16 @@ class GraphBuilder[StateT, GraphInputT, GraphOutputT]:
         self._edges_by_destination[edge.destination_id].append(edge)
 
     def build(self) -> Graph[StateT, GraphInputT, GraphOutputT]:
-        """Need to do the following:
-        * Warn/error if the graph is not connected
-        * Error if the graph does not meet the every-join-has-a-source-fork requirement (otherwise can't know when to proceed past joins)
-        * Generate forks for sources with multiple edges
-        """
+        # TODO: Warn/error if the graph is not connected
+        # TODO: Error if the graph does not meet the every-join-has-a-source-fork requirement (otherwise can't know when to proceed past joins)
+        # TODO: Convert decisions with spreads into "normal" spreads
         # TODO: Allow the user to specify the dominating forks; only infer them if _not_ specified
         # TODO: Verify that any user-specified dominating nodes are _actually_ dominating forks, and if not, generate a helpful error message
-        dominating_forks = _collect_dominating_forks(self._nodes, self._edges_by_source)
+        # TODO: Consider doing a deepcopy here to prevent modifications to the underlying nodes and edges
+        nodes = self._nodes
+        edges = self._edges_by_source
+        nodes, edges = _convert_decision_spreads(nodes, edges)
+        dominating_forks = _collect_dominating_forks(nodes, edges)
 
         return Graph[StateT, GraphInputT, GraphOutputT](
             # deps_type=self.deps_type,
@@ -326,6 +331,36 @@ class GraphBuilder[StateT, GraphInputT, GraphOutputT]:
             edges_by_source=self._edges_by_source,
             dominating_forks=dominating_forks,
         )
+
+
+def _convert_decision_spreads(
+    graph_nodes: dict[NodeId, AnyNode], graph_edges_by_source: dict[NodeId, list[Edge]]
+) -> tuple[dict[NodeId, AnyNode], dict[NodeId, list[Edge]]]:
+    # nodes = dict(graph_nodes)
+    # edges: dict[NodeId, list[Edge]] = defaultdict(list)
+    # edges.update(graph_edges_by_source)
+    # TODO: Decide whether to do mutating updates in this function or not...
+    nodes = graph_nodes
+    edges = graph_edges_by_source
+
+    for node in list(nodes.values()):
+        if isinstance(node, Decision):
+            for branch in node.branches:
+                if branch.spread:
+                    spread = Spread[Any, Any, Any](id=ForkId(NodeId(f'spread:{branch.route_to.id}')))
+                    old_route_to = branch.route_to
+                    nodes[spread.id] = spread
+                    edges[spread.id].append(
+                        Edge(
+                            source_id=spread.id,
+                            transform=branch.post_spread_transform,
+                            destination_id=old_route_to.id,
+                        )
+                    )
+                    branch.route_to = spread
+                    branch.spread = False
+                    branch.post_spread_transform = None
+    return nodes, edges
 
 
 def _collect_dominating_forks(
@@ -482,12 +517,23 @@ class GraphRun[StateT, InputT, OutputT]:
     def _handle_spread(self, spread: Spread[Any, Any, Any], walk: GraphWalkState):
         self._handle_edges(walk, walk.context_inputs, walk.node_inputs)
 
-    def _handle_decision(self, step: Decision[Any, Any], walk: GraphWalkState) -> None:
-        for destination_call, destination_id in step.destinations:
-            if destination_call(walk.node_inputs):
+    def _handle_decision(self, decision: Decision[Any, Any], walk: GraphWalkState) -> None:
+        for branch in decision.branches:
+            # TODO: Need to convert decision branches into spreads during graph building ... otherwise can't use graph analysis
+            assert not branch.spread
+
+            match_tester = branch.matches
+            if match_tester is not None:
+                inputs_match = match_tester(walk.node_inputs)
+            elif branch.source in {Any, object}:
+                inputs_match = True
+            else:
+                inputs_match = isinstance(walk.node_inputs, branch.source)
+
+            if inputs_match:
                 # TODO: Need to apply transforms as required by the EdgeBranch; not yet implemented
                 self.active_walks.append(
-                    GraphWalkState(destination_id, walk.context_inputs, walk.node_inputs, walk.fork_stack)
+                    GraphWalkState(branch.route_to.id, walk.context_inputs, walk.node_inputs, walk.fork_stack)
                 )
                 break
 

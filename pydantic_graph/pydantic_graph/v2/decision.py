@@ -30,22 +30,22 @@ class DecisionBranch[SourceT, EndT]:
     route_to: AnyDestinationNode
     # TODO: Rename `matches` to `test_match` or similar
     matches: Callable[[Any], bool] | None = None
-    transforms: tuple[TransformFunction[Any, Any, Any, Any], ...] = ()
+    transforms: tuple[TransformFunction[Any, Any, Any, Any, Any], ...] = ()
     # TODO: the branch needs a node ID to use as the ID of the spread node
     spread: bool = False
-    post_spread_transform: TransformFunction[Any, Any, Any, Any] | None = None
+    post_spread_transform: TransformFunction[Any, Any, Any, Any, Any] | None = None
 
 
 @dataclass
-class DecisionBranchBuilder[SourceT, GraphStateT, EdgeInputT, EdgeOutputT]:
+class DecisionBranchBuilder[SourceT, GraphStateT, DepsT, EdgeInputT, EdgeOutputT]:
     source: type[SourceT]
     matches: Callable[[Any], bool] | None = None
-    transforms: tuple[TransformFunction[GraphStateT, EdgeInputT, Any, Any], ...] = ()
+    transforms: tuple[TransformFunction[GraphStateT, DepsT, EdgeInputT, Any, Any], ...] = ()
 
     def transform[T](
         self,
-        call: TransformFunction[GraphStateT, EdgeInputT, EdgeOutputT, T],
-    ) -> DecisionBranchBuilder[SourceT, GraphStateT, EdgeInputT, T]:
+        call: TransformFunction[GraphStateT, DepsT, EdgeInputT, EdgeOutputT, T],
+    ) -> DecisionBranchBuilder[SourceT, GraphStateT, DepsT, EdgeInputT, T]:
         new_transforms = self.transforms + (call,)
         return DecisionBranchBuilder(self.source, self.matches, new_transforms)
 
@@ -60,9 +60,9 @@ class DecisionBranchBuilder[SourceT, GraphStateT, EdgeInputT, EdgeOutputT]:
         )
 
     def spread_to[T](  # analogous to GraphBuilder.spreading_edge
-        self: DecisionBranchBuilder[SourceT, GraphStateT, EdgeInputT, Sequence[T]],
+        self: DecisionBranchBuilder[SourceT, GraphStateT, DepsT, EdgeInputT, Sequence[T]],
         node: AnyDestinationNode,
-        post_spread_transform: TransformFunction[GraphStateT, Sequence[T], Any, Any] | None,
+        post_spread_transform: TransformFunction[GraphStateT, DepsT, Sequence[T], Any, Any] | None,
     ) -> DecisionBranch[SourceT, Never]:
         return DecisionBranch[SourceT, Never](
             source=self.source,
@@ -82,22 +82,3 @@ class DecisionBranchBuilder[SourceT, GraphStateT, EdgeInputT, EdgeOutputT]:
             matches=self.matches,
             transforms=self.transforms,
         )
-
-
-# TODO: Move this to being a GraphBuilder method that includes the graph state type
-def handle[SourceT](
-    case: type[SourceT], matches: Callable[[Any], bool] | None = None
-) -> DecisionBranchBuilder[SourceT, Any, Any, Any]:
-    if matches is None:
-        if case in {Any, object}:
-
-            def default_matches_branch(x: Any) -> bool:
-                return True
-        else:
-
-            def default_matches_branch(x: Any) -> bool:
-                return isinstance(x, case)
-
-        matches = default_matches_branch
-
-    return DecisionBranchBuilder(case, matches, transforms=())

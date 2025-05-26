@@ -31,7 +31,7 @@ class EndNode(str, Enum):
 START = StartNode.start
 END = EndNode.end
 
-type AnyMiddleNode = Step[Any, Any, Any] | Join[Any, Any, Any] | Spread[Any, Any, Any]
+type AnyMiddleNode = Step[Any, Any, Any, Any] | Join[Any, Any, Any, Any] | Spread[Any, Any, Any, Any]
 type AnySourceNode = AnyMiddleNode | StartNode
 type AnyDestinationNode = AnyMiddleNode | EndNode | Decision[Any, Any]
 type AnyNode = AnySourceNode | AnyDestinationNode

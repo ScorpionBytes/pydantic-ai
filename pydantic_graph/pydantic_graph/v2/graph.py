@@ -113,10 +113,10 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         )
 
     @staticmethod
-    def decision(*, node_id: str | None = None) -> Decision[StateT, DepsT, Never, Never]:
+    def decision(*, node_id: str | None = None, note: str | None = None) -> Decision[StateT, DepsT, Never, Never]:
         if node_id is None:
             node_id = f'decision-{get_unique_string()}'
-        return Decision[StateT, DepsT, Never, Never](id=NodeId(node_id), branches=[])
+        return Decision[StateT, DepsT, Never, Never](id=NodeId(node_id), branches=[], note=note)
 
     # TODO: Add a method more closely related to edge building that accepts the input node as a way to get a type-checked input
     #   Alternatively, add InputT as a type on Decision, and include it in the output of DecisionBranchBuilder, and do type-checking of it.

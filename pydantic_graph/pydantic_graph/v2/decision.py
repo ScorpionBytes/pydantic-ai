@@ -18,11 +18,12 @@ if TYPE_CHECKING:
 class Decision[StateT, DepsT, SourceT, EndT]:
     id: NodeId
     branches: list[DecisionBranch[StateT, DepsT, Any, Any]]
+    note: str | None
 
     def branch[S, E, S2, E2](
         self: Decision[StateT, DepsT, S, E], branch: DecisionBranch[StateT, DepsT, S2, E2]
     ) -> Decision[StateT, DepsT, S | S2, E | E2]:
-        return Decision(id=self.id, branches=self.branches + [branch])
+        return Decision(id=self.id, branches=self.branches + [branch], note=self.note)
 
     def _force_source_invariant(self, source: SourceT) -> SourceT:
         raise RuntimeError('This method should never be called, it is just defined for typing purposes.')

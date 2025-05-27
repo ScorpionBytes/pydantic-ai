@@ -69,22 +69,25 @@ def generate_code(
     for node in graph.nodes.values():
         # List all nodes in order they were created
         #
-        line: str | None = None
+        node_lines: list[str] = []
         if isinstance(node, (StartNode, EndNode)):
             pass
         elif isinstance(node, Step):
             line = f'  {node.id}'
             if node.label:
                 line += f': {node.label}'
+            node_lines.append(line)
         elif isinstance(node, Join):
-            line = f'  state {node.id} <<join>>'
+            node_lines = [f'  state {node.id} <<join>>']
         elif isinstance(node, Spread):
-            line = f'  state {node.id} <<fork>>'
+            node_lines = [f'  state {node.id} <<fork>>']
         elif isinstance(node, Decision):
-            line = f'  state {node.id} <<choice>>'
+            node_lines = [f'  state {node.id} <<choice>>']
+            if node.note:
+                node_lines.append(f'  note right of {node.id}\n    {node.note}\n  end note')
 
-        if line:
-            lines.append(line)
+
+        lines.extend(node_lines)
 
     lines.append('')
 

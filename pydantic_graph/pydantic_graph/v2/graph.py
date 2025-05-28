@@ -6,6 +6,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable, Never, cast, get_args, get_origin, overload
 
+from anyio import Event, create_memory_object_stream, create_task_group
+from anyio.abc import TaskGroup
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from typing_extensions import assert_never
 
 from pydantic_graph.v2.decision import Decision, DecisionBranchBuilder
@@ -73,6 +76,8 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
     deps_type: type[DepsT]
     input_type: type[GraphInputT]
     output_type: type[TypeUnion[GraphOutputT]] | type[GraphOutputT]
+
+    parallel: bool = True  # if False, allow direct state modification and don't copy state sent to steps, but disallow parallel node execution
 
     _nodes: dict[NodeId, AnyNode] = field(init=False, default_factory=dict)
     _edges_by_source: dict[NodeId, list[Edge]] = field(init=False, default_factory=lambda: defaultdict(list))
@@ -397,14 +402,14 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
         assert edge.destination_id in self._nodes, f'Edge destination {edge.destination_id} not found in graph'
         self._edges_by_source[edge.source_id].append(edge)
 
-    def build(self) -> Graph[StateT, DepsT, GraphInputT, GraphOutputT]:
+    def build(self, parallel: bool = True) -> Graph[StateT, DepsT, GraphInputT, GraphOutputT]:
         # TODO: Warn/error if the graph is not connected
         # TODO: Warn/error if any non-End node is a dead end
-        # TODO: Error if the graph does not meet the every-join-has-a-source-fork requirement (otherwise can't know when to proceed past joins)
-        # TODO: Convert decisions with spreads into "normal" spreads
-        # TODO: Allow the user to specify the dominating forks; only infer them if _not_ specified
-        # TODO: Verify that any user-specified dominating nodes are _actually_ dominating forks, and if not, generate a helpful error message
+        # TODO: Error if the graph does not meet the every-join-has-a-parent-fork requirement (otherwise can't know when to proceed past joins)
+        # TODO: Allow the user to specify the parent forks; only infer them if _not_ specified
+        # TODO: Verify that any user-specified parent forks are _actually_ valid parent forks, and if not, generate a helpful error message
         # TODO: Consider doing a deepcopy here to prevent modifications to the underlying nodes and edges
+        # TODO: Error if `parallel` is False but the graph has forks / spreads
         nodes = self._nodes
         edges = self._edges_by_source
         nodes, edges = _convert_decision_spreads(nodes, edges)
@@ -419,6 +424,7 @@ class GraphBuilder[StateT, DepsT, GraphInputT, GraphOutputT]:
             deps_type=self.deps_type,
             input_type=self.input_type,
             output_type=output_type,
+            parallel=parallel,
             nodes=self._nodes,
             edges_by_source=self._edges_by_source,
             parent_forks=parent_forks,
@@ -495,6 +501,8 @@ class Graph[StateT, DepsT, InputT, OutputT]:
     edges_by_source: dict[NodeId, list[Edge]]
     parent_forks: dict[JoinId, ParentFork[NodeId]]
 
+    parallel: bool  # if False, allow direct state modification and don't copy state sent to steps, but disallow parallel node execution
+
     @property
     def start_edges(self) -> list[Edge]:
         return self.edges_by_source.get(START.id, [])
@@ -506,7 +514,7 @@ class Graph[StateT, DepsT, InputT, OutputT]:
         return result
 
     async def run(self, state: StateT, deps: DepsT, inputs: InputT) -> OutputT:
-        return await GraphRun(self, state, deps, inputs).run()
+        return await GraphRun(self, state, deps, inputs).run_async()
 
     def render(self, *, title: str | None = None, direction: StateDiagramDirection | None = None) -> str:
         return generate_code(self, title=title, direction=direction)
@@ -515,10 +523,11 @@ class Graph[StateT, DepsT, InputT, OutputT]:
         return self.render()
 
 
+WalkerID = uuid.UUID
+
+
 @dataclass
 class GraphWalkState:
-    # id: WalkerId
-
     # With our current BaseNode thing, next_node_id and next_node_inputs are merged into `next_node` itself
     node_id: NodeId
     context_inputs: Any
@@ -531,6 +540,8 @@ class GraphWalkState:
     Stack of forks that have been entered; used so that the GraphRunner can decide when to proceed through joins
     """
 
+    walker_id: WalkerID = field(default_factory=uuid.uuid4)
+
 
 # TODO: Move `Some` and `Maybe` to util?
 @dataclass
@@ -539,6 +550,42 @@ class Some[T]:
 
 
 type Maybe[T] = Some[T] | None  # like optional, but you can tell the difference between "no value" and "value is None"
+
+"""
+Questions:
+* Should you be able to modify state outside of steps and reducer-finalize?
+    * E.g., can you modify state in transforms? In reducer input handling? Currently you can access state there..
+    * More generally, what do we do about handling state with concurrency?
+    * When is state "snapshotted" into persistence? At the start/end of steps/joins, and the whole graph run? Any other time?
+    * Is there an option to not persist state at all? It seems yes?
+    * Note: it's hard/impossible to resume after an interrupt if you can just make changes to state at any time, because you can't resume from a specific line of code
+        * We could allow all active tasks to end before the interrupt goes through, but it feels to me like a reducer-based system might be preferable...
+
+* If the graph run is interrupted, what state needs to be preserved to resume?
+    * active reducers, active walks, state, anything else?
+    * what needs to happen to concurrently-running tasks if an interruption happens? they get canceled? an error? do we provide some form of interrupt-handling within the context of a larger graph run?
+* Should transforms, decisions, and/or reducers be allowed to be async?
+
+
+
+Conclusions:
+* Everything is sync except step runs
+* We allow you to run the graph in a way that state updates are just made on demand, but discourage this (somewhere on the spectrum between docs and runtime error)
+when running with parallel execution.
+* To allow parallel execution, you need to set `mode='parallel'` as a kwarg to the graph builder, or maybe use a graph subclass or something
+    * In parallel mode, you get a runtime error if you try to modify state without using a reducer callback
+    * In non-parallel mode, you get a runtime error if you try to create multiple edges from the same node (or create spreads)
+    * We recommend updating state using reducer callbacks (recorded on the RunContext) when executing multiple nodes in parallel
+* We're not worrying about distributed execution for now, in particular, allowing arbitrary callbacks that modify state in-place as the way we do state updates 
+"""
+
+
+@dataclass
+class GraphRunSynchronizer:
+    task_group: TaskGroup
+    send_stream: MemoryObjectSendStream[tuple[GraphWalkState, Any]]
+    receive_stream: MemoryObjectReceiveStream[tuple[GraphWalkState, Any]]
+    finish_event: Event
 
 
 @dataclass(init=False)
@@ -557,35 +604,31 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
         self.inputs = inputs
 
         self.result: Maybe[OutputT] = None
-        self.active_walks: list[GraphWalkState] = [
-            GraphWalkState(node_id=START.id, context_inputs=self.inputs, node_inputs=self.inputs, fork_stack=())
-        ]
+        self.active_walks: dict[WalkerID, GraphWalkState] = {}
 
         self.active_reducers: dict[tuple[NodeId, NodeRunId], Reducer[StateT, DepsT, Any, Any]] = {}
         """The node id is for the join, the node run id is for the dominating fork."""
 
-    async def run(self):
-        # TODO: Refactor this to actually run distinct walks in parallel in the async event loop using a task group
-        #   I'm implementing it in a blocking way for now to get the basic functionality working
-        while self.active_walks:
-            walk = self.active_walks.pop()
-            node = self.graph.nodes[walk.node_id]
+    async def run_async(self):
+        async def handle_finished_steps(
+            receive: MemoryObjectReceiveStream[tuple[GraphWalkState, Any]], synch: GraphRunSynchronizer
+        ) -> None:
+            async with receive:
+                async for walk, output in receive:
+                    self._end_step(walk, output, synch)
 
-            if isinstance(node, StartNode):
-                self._handle_start(walk)
-            elif isinstance(node, Step):
-                self._handle_step(node, walk)
-            elif isinstance(node, Join):
-                self._handle_reduce_join(node, walk)
-            elif isinstance(node, Spread):
-                self._handle_spread(walk)
-            elif isinstance(node, Decision):
-                self._handle_decision(node, walk)
-            elif isinstance(node, EndNode):
-                self._handle_end(walk)
+        async with create_task_group() as tg:
+            send_result_stream, receive_result_stream = create_memory_object_stream[tuple[GraphWalkState, Any]]()
+            finish_event = Event()
+            synchronizer = GraphRunSynchronizer(tg, send_result_stream, receive_result_stream, finish_event)
+            tg.start_soon(handle_finished_steps, receive_result_stream, synchronizer)
 
-            # Now that we've handled edges for the node, we can check if any joins are ready to proceed, and if so, proceed
-            self._handle_finalize_joins(walk)
+            with send_result_stream:
+                start_state = GraphWalkState(
+                    node_id=START.id, context_inputs=self.inputs, node_inputs=self.inputs, fork_stack=()
+                )
+                self._handle_walk(start_state, synchronizer)
+                await finish_event.wait()
 
         if self.result is None:
             raise RuntimeError(
@@ -594,14 +637,46 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
 
         return self.result.value
 
-    def _handle_start(self, walk: GraphWalkState) -> None:
-        # nothing to do besides start the graph
-        self._handle_edges(walk, walk.context_inputs, walk.node_inputs)
+    def _handle_walk(self, walk: GraphWalkState, synchronizer: GraphRunSynchronizer) -> None:
+        self.active_walks[walk.walker_id] = walk
+        node = self.graph.nodes[walk.node_id]
 
-    def _handle_step(self, step: Step[Any, Any, Any, Any], walk: GraphWalkState):
+        if isinstance(node, StartNode):
+            self._handle_start(walk, synchronizer)
+        elif isinstance(node, Step):
+            self._begin_step(node, walk, synchronizer)
+        elif isinstance(node, Join):
+            self._handle_reduce_join(node, walk)
+        elif isinstance(node, Spread):
+            self._handle_spread(walk, synchronizer)
+        elif isinstance(node, Decision):
+            self._handle_decision(node, walk, synchronizer)
+        elif isinstance(node, EndNode):
+            self._handle_end(walk)
+
+        self.active_walks.pop(walk.walker_id)
+
+        # Now that we've handled edges for the node, we can check if any joins are ready to proceed, and if so, proceed
+        self._handle_finalize_joins(walk, synchronizer)
+
+        if not self.active_walks:
+            synchronizer.finish_event.set()
+
+    def _handle_start(self, walk: GraphWalkState, synchronizer: GraphRunSynchronizer) -> None:
+        # nothing to do besides start the graph
+        self._handle_edges(walk, walk.context_inputs, walk.node_inputs, synchronizer)
+
+    def _begin_step(self, step: Step[Any, Any, Any, Any], walk: GraphWalkState, synchronizer: GraphRunSynchronizer):
         step_context = StepContext(self.state, self.deps, walk.context_inputs)
-        output = step.call(step_context)
-        self._handle_edges(walk, output, output)
+
+        async def handle_step() -> Any:
+            output = await step.call(step_context)
+            await synchronizer.send_stream.send((walk, output))
+
+        synchronizer.task_group.start_soon(handle_step)
+
+    def _end_step(self, walk: GraphWalkState, output: Any, synchronizer: GraphRunSynchronizer) -> None:
+        self._handle_edges(walk, output, output, synchronizer)
 
     def _handle_reduce_join(self, join: Join[Any, Any, Any, Any], walk: GraphWalkState) -> None:
         # Find the matching fork run id in the stack; this will be used to look for an active reducer
@@ -622,10 +697,12 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
         ctx = ReducerContext(self.state, self.deps, walk.node_inputs)
         reducer.reduce(ctx)
 
-    def _handle_spread(self, walk: GraphWalkState):
-        self._handle_edges(walk, walk.context_inputs, walk.node_inputs)
+    def _handle_spread(self, walk: GraphWalkState, synchronizer: GraphRunSynchronizer):
+        self._handle_edges(walk, walk.context_inputs, walk.node_inputs, synchronizer)
 
-    def _handle_decision(self, decision: Decision[StateT, DepsT, Any, Any], walk: GraphWalkState) -> None:
+    def _handle_decision(
+        self, decision: Decision[StateT, DepsT, Any, Any], walk: GraphWalkState, synchronizer: GraphRunSynchronizer
+    ) -> None:
         for branch in decision.branches:
             assert not branch.spread, 'Spreads decisions should be converted into spreads as part of graph-building'
 
@@ -642,8 +719,9 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
                 for transform in branch.transforms:
                     ctx = TransformContext(self.state, self.deps, walk.context_inputs, node_inputs)
                     node_inputs = transform(ctx)
-                self.active_walks.append(
-                    GraphWalkState(branch.route_to.id, walk.context_inputs, walk.node_inputs, walk.fork_stack)
+                self._handle_walk(
+                    GraphWalkState(branch.route_to.id, walk.context_inputs, walk.node_inputs, walk.fork_stack),
+                    synchronizer,
                 )
                 break
 
@@ -651,7 +729,7 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
         self.result = Some(walk.node_inputs)
         # TODO: Probably want to cancel all other walks, terminate the run, etc.
 
-    def _handle_finalize_joins(self, popped_walk: GraphWalkState) -> None:
+    def _handle_finalize_joins(self, popped_walk: GraphWalkState, synchronizer: GraphRunSynchronizer) -> None:
         # If the popped walk was the last item preventing one or more joins, those joins can now be finalized
         walk_fork_run_ids = {fork_run_id: i for i, (_, fork_run_id) in enumerate(popped_walk.fork_stack)}
         active_reducers_items = list(
@@ -665,7 +743,7 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
             if fork_run_index is not None:
                 # This reducer _may_ now be ready to finalize:
                 join_can_proceed = True
-                for walk in self.active_walks:
+                for walk in self.active_walks.values():
                     # might be a good idea to hold walks_by_fork_id in memory to reduce overhead here
                     if fork_run_id in {x[1] for x in walk.fork_stack}:
                         join_can_proceed = False
@@ -676,9 +754,13 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
                     new_fork_stack = popped_walk.fork_stack[:fork_run_index]
                     self.active_reducers.pop((join_id, fork_run_id))
                     # Should _now_ traverse the edges leaving this join
-                    self._handle_edges(GraphWalkState(join_id, None, None, new_fork_stack), output, output)
+                    self._handle_edges(
+                        GraphWalkState(join_id, None, None, new_fork_stack), output, output, synchronizer
+                    )
 
-    def _handle_edges(self, walk: GraphWalkState, context_inputs: Any, next_node_inputs: Any) -> None:
+    def _handle_edges(
+        self, walk: GraphWalkState, context_inputs: Any, next_node_inputs: Any, synchronizer: GraphRunSynchronizer
+    ) -> None:
         edges = self.graph.edges_by_source.get(walk.node_id, [])
         node = self.graph.nodes[walk.node_id]
 
@@ -698,8 +780,8 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
                     transform_context = TransformContext(self.state, self.deps, context_inputs, next_node_inputs)
                     next_node_inputs = edge.transform(transform_context)
 
-                self.active_walks.append(
-                    GraphWalkState(edge.destination_id, context_inputs, next_node_inputs, fork_stack)
+                self._handle_walk(
+                    GraphWalkState(edge.destination_id, context_inputs, next_node_inputs, fork_stack), synchronizer
                 )
         elif isinstance(node, Spread):
             for edge in edges:
@@ -707,80 +789,8 @@ class GraphRun[StateT, DepsT, InputT, OutputT]:
                     if edge.transform is not None:
                         transform_context = TransformContext(self.state, self.deps, context_inputs, item)
                         item = edge.transform(transform_context)
-                    self.active_walks.append(GraphWalkState(edge.destination_id, context_inputs, item, fork_stack))
+                    self._handle_walk(
+                        GraphWalkState(edge.destination_id, context_inputs, item, fork_stack), synchronizer
+                    )
         else:
             assert_never(node)
-
-    # async def run(self):
-    #     from anyio import create_task_group, create_memory_object_stream
-    #     from anyio.streams.memory import MemoryObjectReceiveStream
-    #     send_result_stream, receive_result_stream = create_memory_object_stream[Any]()
-    #
-    #     async def run_step(step_ref: GraphWalkStep, inputs: Any):
-    #         # # TODO: Handle Spread, Decision, StartNode, Step, Join, EndNode
-    #         node = self.graph.nodes[step_ref.node_id]
-    #         output = inputs
-    #         if isinstance(node, Step):
-    #             step_context = StepContext(self.state, inputs)
-    #             output = node.call(step_context)
-    #         elif isinstance(node, Join):
-    #             dominating_fork = self.graph.get_dominating_fork(node.id)
-    #             matching_fork = next(iter((x for x in step_ref.fork_stack[::-1] if x[0] == dominating_fork.fork_id)),
-    #                                  None)
-    #             if matching_fork is None:
-    #                 raise RuntimeError(
-    #                     f'Fork {node.id} not found in stack {step_ref.fork_stack}. This means the dominating fork is not dominating (this is a bug).')
-    #             fork_node_run_id = matching_fork[1]
-    #             active_reducer = self.active_reducers.get((node.id, fork_node_run_id))
-    #             if active_reducer is None:
-    #                 active_reducer = node.reducer_factory(self.state, inputs)
-    #                 self.active_reducers[(node.id, fork_node_run_id)] = active_reducer
-    #             active_reducer.reduce(self.state, inputs)
-    #         elif isinstance(node, Spread):
-    #             # TODO: The API currently suggests that you could access the output of the previous (pre-Spread) step, but it doesn't work that way now.
-    #             pass
-    #
-    #         # TODO: Remove the reference to this task so that the handle_edges can check if any joins should proceed...
-    #         await handle_edges(node, inputs, output)
-    #
-    #     async def handle_edges(source: AnyNode, inputs: Any, outputs: Any) -> None:
-    #         edges = self.graph.edges_by_source.get(source.id, [])
-    #         # Edge transitions should be fast, so don't need to be handled in parallel
-    #         for edge in edges:
-    #             next_steps = ...
-    #             destination = edge.destination(self.graph.nodes)
-    #             if isinstance(destination, EndNode):
-    #         if isinstance(source, StartNode):
-    #
-    #
-    #         # assert not isinstance(node, (EndNode, Spread, Decision))  # should be Start, Step, Join
-    #         # if isinstance(node, StartNode):
-    #         #     for edge in self.graph.edges_by_source[step.node_id]:
-    #         #         # TODO: Should transforms be done in parallel?
-    #         #         if edge.transform
-    #         # step_result = step.run(self.graph, self.state)
-    #         # await send_result_stream.send(step_result)
-    #
-    #     async def process_results(receive_stream: MemoryObjectReceiveStream[NodeExecutionResult]) -> None:
-    #         async with receive_stream:
-    #             async for result in receive_stream:
-    #                 should_end_run = await self.handle_node_result(result)
-    #                 if should_end_run:
-    #                     # Exit any running tasks; useful for eager exit
-    #                     tg.cancel_scope.cancel()
-    #
-    #     async with create_task_group() as tg:
-    #         async with send_result_stream:
-    #             tg.start_soon(process_results, receive_result_stream)
-    #
-    #             first_step = GraphWalkStep(
-    #                 node_id=START.id,
-    #                 inputs=self.inputs,
-    #                 fork_stack=[],
-    #             )
-    #             tg.start_soon(run_step, first_step)
-
-    # async def handle_node_result(self, result: NodeExecutionResult) -> bool:
-    #     # Returns True if the full run is complete, so that any remaining-but-no-longer-relevant tasks can be canceled
-    #     # TODO: Implement..
-    #     raise NotImplementedError

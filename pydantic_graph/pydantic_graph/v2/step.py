@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -34,7 +35,7 @@ class StepContext[StateT, DepsT, InputT]:
 class StepCallProtocol[StateT, DepsT, InputT, OutputT](Protocol):
     """The purpose of this is to make it possible to deserialize step calls similar to how Evaluators work."""
 
-    def __call__(self, ctx: StepContext[StateT, DepsT, InputT]) -> OutputT:
+    def __call__(self, ctx: StepContext[StateT, DepsT, InputT]) -> Awaitable[OutputT]:
         raise NotImplementedError
 
 

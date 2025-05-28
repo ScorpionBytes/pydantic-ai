@@ -86,7 +86,6 @@ def generate_code(
             if node.note:
                 node_lines.append(f'  note right of {node.id}\n    {node.note}\n  end note')
 
-
         lines.extend(node_lines)
 
     lines.append('')
